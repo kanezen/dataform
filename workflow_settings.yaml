@@ -1,0 +1,5 @@
+defaultProject: kuradashi-fivetran-staging
+defaultLocation: asia-northeast1
+defaultDataset: shopify_kuradashi_jp_staging_analysis
+defaultAssertionDataset: shopify_kuradashi_jp_staging_assertion
+dataformCoreVersion: 3.0.0

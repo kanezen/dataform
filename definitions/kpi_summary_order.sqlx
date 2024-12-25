@@ -1,0 +1,373 @@
+config {
+    type: "incremental",
+    tags: ["kpi_summary_order"]
+}
+
+  -- ソースとなるデータをCTEまたはテンポラリテーブルで定義
+WITH
+  order_shipping_tax_line_by_order AS (
+    # orderごとの税額とrateの取得(2レコード存在する場合があるのでgroup by)
+  SELECT
+    order_id,
+    SUM(order_shipping_tax_line.price) AS price,
+    AVG(order_shipping_tax_line.rate) AS rate
+  FROM
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging.order_shipping_line order_shipping_line
+  LEFT JOIN
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging.order_shipping_tax_line order_shipping_tax_line
+  ON
+    order_shipping_line.id = order_shipping_tax_line.order_shipping_line_id
+  GROUP BY
+    order_id ),
+  master_discount_coupon AS (
+    # マーケ用にスプレッドシートで定義したspreadsheet_master_discount_codeを追加して絞り込みを行う用
+    # マーケティング費用としての割引を判別するため
+  SELECT
+    *
+  FROM
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging_analysis.spreadsheet_master_discount_code ),
+  customer_with_registered_month AS (
+    # ユーザーの登録月算出用
+  SELECT
+    id AS customer_id,
+    DATE(FORMAT_TIMESTAMP('%Y-%m-01', MIN(registered_at), 'Asia/Tokyo')) AS registered_month,
+  FROM
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging_l2_datamart.customers
+  GROUP BY
+    id ),
+  product AS (
+    # product別の商品情報
+  SELECT
+    *
+  FROM
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging_analysis.product_with__delivery_type__deadline ),
+  product_variant AS (
+    # product_variant別の商品情報
+  SELECT
+    *
+  FROM
+    -- 新対応
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging_analysis.product_variant_with__delivery_type__deadline ),
+  unit_cost AS (
+    # variantの商品コスト情報(snapshotから)
+  SELECT
+    JSON_VALUE(line_items, "$.id") AS line_item_id,
+    JSON_VALUE(line_items, "$.variant.id") AS variant_id,
+    JSON_VALUE(line_items, "$.variant.inventoryItem.unitCost") AS unit_cost,
+  FROM
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging.metafield
+  LEFT JOIN
+    UNNEST(JSON_QUERY_ARRAY(JSON_EXTRACT(value, "$.lineItems"))) AS line_items
+  WHERE
+    1=1
+    AND namespace = 'snapshot'
+    AND KEY = 'variants'
+    AND owner_resource IN ('order',
+      'ORDER') ),
+  ct_tax_line AS (
+    # order_line別のtax情報
+  SELECT
+    order_line_id,
+    SUM(price) AS price,
+    SUM(CAST(JSON_VALUE(price_set, "$.shop_money.amount") AS float64)) AS shop_money_amount,
+    MIN(rate) AS rate,
+    MIN(title) AS title,
+  FROM
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging.tax_line tax_line
+  WHERE
+    title = 'CT'
+  GROUP BY
+    order_line_id ),
+  first_product_order AS (
+    # 初回購入のorderかどうか判定用
+  SELECT
+    orders.order_id,
+    orders.order_line_id,
+    orders.customer_id,
+    orders.order_id = (FIRST_VALUE(orders.order_id) OVER (PARTITION BY orders.customer_id ORDER BY processed_at ASC)) AS is_first_product_order,
+    (FIRST_VALUE(orders.order_id) OVER (PARTITION BY orders.customer_id ORDER BY processed_at ASC)) AS first_product_order_id,
+    DENSE_RANK() OVER (PARTITION BY orders.customer_id ORDER BY processed_at ASC) AS product_order_count,
+  FROM
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging_l2_datamart.orders orders
+  WHERE
+    orders.sku NOT IN('PREMIUMMEMBER') ),
+  soruce_fixed_orders AS (
+    # orderに対するtax情報を追加
+  SELECT
+    orders.* EXCEPT(product_id,
+      tax_price,
+      tax_rate),
+    IFNULL(orders.product_id, ARRAY(
+      SELECT
+        product_id
+      FROM
+        product_variant
+      WHERE
+        product_variant.sku = orders.sku)[SAFE_OFFSET(0)]) AS product_id,
+    orders.product_variant_id AS variant_id,
+    ct_tax_line.price AS tax_price,
+    ct_tax_line.rate AS tax_rate,
+  FROM
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging_l2_datamart.orders orders
+  LEFT JOIN
+    ct_tax_line
+  ON
+    orders.order_line_id = ct_tax_line.order_line_id ),
+  orders AS (
+    # BtoBを加味した情報、計算済みcost関連情報を付与
+  SELECT
+    soruce_fixed_orders.* EXCEPT(cost_without_tax),
+    IFNULL(soruce_fixed_orders.cost_without_tax, product_variant.cost) AS cost_without_tax,
+    order_line.gift_card,
+    soruce_fixed_orders.order_id = (FIRST_VALUE(soruce_fixed_orders.order_id) OVER (PARTITION BY soruce_fixed_orders.customer_id ORDER BY processed_at ASC)) AS is_first_order,
+    (FIRST_VALUE(soruce_fixed_orders.order_id) OVER (PARTITION BY soruce_fixed_orders.customer_id ORDER BY processed_at ASC)) AS first_order_id,
+    DENSE_RANK() OVER (PARTITION BY soruce_fixed_orders.customer_id ORDER BY processed_at ASC) AS order_count,
+    IFNULL(first_product_order.is_first_product_order, FALSE) AS is_first_product_order,
+    first_product_order.first_product_order_id AS first_product_order_id,
+    first_product_order.product_order_count AS product_order_count,
+  IF
+    (EXISTS (
+      SELECT
+        1
+      FROM
+        kuradashi-fivetran-staging.shopify_kuradashi_jp_staging.order_tag
+      WHERE
+        order_id = soruce_fixed_orders.order_id
+        AND value = 'B2B' ), TRUE, FALSE) AS isB2B
+  FROM
+    soruce_fixed_orders
+  INNER JOIN
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging.order_line order_line
+  ON
+    soruce_fixed_orders.order_line_id = order_line.id
+  LEFT JOIN
+    first_product_order
+  ON
+    soruce_fixed_orders.order_line_id = first_product_order.order_line_id
+  LEFT JOIN
+    ct_tax_line
+  ON
+    soruce_fixed_orders.order_line_id = ct_tax_line.order_line_id
+  LEFT JOIN
+    product_variant
+  ON
+    soruce_fixed_orders.variant_id = product_variant.product_variant_id ),
+  aggregation_orders AS (
+    # 最終の集計用データとしての属性を付与した情報化
+  SELECT
+    orders.order_id,
+    orders.financial_status,
+    orders.processed_at,
+    customer_with_registered_month.registered_month,
+    (customer_with_registered_month.registered_month != DATE(FORMAT_TIMESTAMP('%Y-%m-01', orders.processed_at, 'Asia/Tokyo'))) AS is_repeated,
+    orders.order_line_id,
+    orders.customer_id,
+    orders.product_id,
+    orders.product_variant_id,
+    IFNULL(product_variant.product_title, product.title) AS product_title,
+    product_variant.product_variant_title,
+    orders.collection_tag,
+    orders.sku,
+    IFNULL(product_variant.handle, product.handle) AS handle,
+    IFNULL(product_variant.product_type, product.product_type) AS product_type,
+    IFNULL(product_variant.vendor, product.vendor) AS vendor,
+    IFNULL(product_variant.deadline, product.deadline) AS deadline,
+    IFNULL(product_variant.middle_category, product.middle_category) AS middle_category,
+    IFNULL(product_variant.is_stock, product.is_stock) AS is_stock,
+    IFNULL(product_variant.is_ordering, product.is_ordering) AS is_ordering,
+    IFNULL(product_variant.is_direct_delivery, product.is_direct_delivery) AS is_direct_delivery,
+    IFNULL(product_variant.is_strategy_product, product.is_strategy_product) AS is_strategy_product,
+    IFNULL(product_variant.is_strategy_vendor, product.is_strategy_vendor) AS is_strategy_vendor,
+    IFNULL(product_variant.delivery_type, product.delivery_type) AS delivery_type,
+    IFNULL(product_variant.grams, product.grams) AS grams,
+    IFNULL(product_variant.is_pantry, product.is_pantry) AS is_pantry,
+    -- pantry_child判定がFALSEのとき, product側もみる
+    IFNULL(product_variant.is_pantry_child, product.is_pantry_child) AS is_pantry_child,
+    IFNULL(product_variant.product_variant_purchasing_manager, product_variant.product_registration_purchasing_manager) AS purchasing_manager,
+    orders.gift_card,
+    orders.quantity,
+    orders.total_price_with_tax,
+    orders.price_with_tax,
+    orders.discount,
+    FLOOR(discount / (1+tax_rate)) AS discount_without_tax,
+    orders.discount_code,
+    orders.tax_price,
+    orders.tax_rate,
+    IFNULL(orders.ordered_total_shipping_price_with_tax, 0) AS ordered_total_shipping_price_with_tax,
+  IF
+    (orders.ordered_total_shipping_price_with_tax IS NULL, 0, order_shipping_tax_line_by_order.price) AS shipping_tax_price,
+    order_shipping_tax_line_by_order.rate AS shipping_tax_rate,
+    /*
+    IF(orders.ordered_total_shipping_price_with_tax IS NULL, 0, order_shipping_tax_line.price) AS shipping_tax_price,
+    order_shipping_tax_line.rate AS shipping_tax_rate,
+    */
+    FLOOR((price_with_tax * quantity - discount) / (1+tax_rate)) AS total_product_only_price_without_tax,
+  IF
+    (orders.cost_without_tax IS NULL, 0, (orders.cost_without_tax * orders.quantity)) AS total_cost_without_tax,
+  IF
+    (orders.cost_without_tax IS NULL,
+    IF
+      (orders.gift_card, FLOOR((price_with_tax * quantity - discount) / (1+tax_rate)), 0), FLOOR((price_with_tax * quantity - discount) / (1+tax_rate)) - (orders.cost_without_tax * orders.quantity) ) AS gross_margin,
+    orders.isB2B AS isB2B,
+  FROM
+    orders
+  LEFT JOIN
+    order_shipping_tax_line_by_order
+  ON
+    orders.order_id = order_shipping_tax_line_by_order.order_id
+    /*
+    LEFT JOIN
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging.order_shipping_line order_shipping_line
+    ON
+    orders.order_id = order_shipping_line.order_id
+    LEFT JOIN
+    kuradashi-fivetran-staging.shopify_kuradashi_jp_staging.order_shipping_tax_line order_shipping_tax_line
+    ON
+    order_shipping_line.id = order_shipping_tax_line.order_shipping_line_id
+    */
+  LEFT JOIN
+    product_variant
+  ON
+    orders.product_variant_id = product_variant.product_variant_id
+  LEFT JOIN
+    product
+  ON
+    orders.product_id = product.id
+  LEFT JOIN
+    customer_with_registered_month
+  ON
+    orders.customer_id = customer_with_registered_month.customer_id ),
+  aggregation_orders_parent AS (
+    # pantry_childを抜いた親orderのみとして取得
+  SELECT
+    *
+  FROM
+    aggregation_orders
+  WHERE
+    1=1
+    AND is_pantry_child IS FALSE ),
+  aggregation_orders_child_sum AS (
+    # 親に紐づけるpantryやorder_child関連のSUM
+  SELECT
+    order_id,
+    SUM(grams) AS grams,
+    1 AS quantity,
+    SUM(total_price_with_tax) AS total_price_with_tax,
+    SUM(price_with_tax) AS price_with_tax,
+    SUM(discount) AS discount,
+    SUM(discount_without_tax) AS discount_without_tax,
+    SUM(tax_price) AS tax_price,
+    #        (SUM(tax_rate) / COUNT(order_id)) AS tax_rate,
+    SUM(ordered_total_shipping_price_with_tax) AS ordered_total_shipping_price_with_tax,
+    SUM(shipping_tax_price) AS shipping_tax_price,
+    #        (SUM(shipping_tax_rate) / COUNT(order_id)) AS shipping_tax_rate,
+    SUM(total_product_only_price_without_tax) AS total_product_only_price_without_tax,
+    SUM(total_cost_without_tax) AS total_cost_without_tax,
+    SUM(gross_margin) AS gross_margin,
+  FROM
+    aggregation_orders
+  WHERE
+    1=1
+    AND is_pantry_child IS TRUE
+  GROUP BY
+    order_id ),
+  aggregation_orders_merged AS (
+    # parentに対してchild情報のSUMを上書き
+    # pantryの場合はparentは数字の実体を持たないため上書き
+  SELECT
+    -- aggregation_orders_parentの上書き以外のカラムを選択
+    aggregation_orders_parent.* EXCEPT( grams,
+      quantity,
+      total_price_with_tax,
+      price_with_tax,
+      discount,
+      discount_without_tax,
+      tax_price,
+      ordered_total_shipping_price_with_tax,
+      shipping_tax_price,
+      total_product_only_price_without_tax,
+      total_cost_without_tax,
+      gross_margin ),
+    IFNULL(aggregation_orders_child_sum.grams, aggregation_orders_parent.grams) AS grams,
+    IFNULL(aggregation_orders_child_sum.quantity, aggregation_orders_parent.quantity) AS quantity,
+    IFNULL(aggregation_orders_child_sum.total_price_with_tax, aggregation_orders_parent.total_price_with_tax) AS total_price_with_tax,
+    IFNULL(aggregation_orders_child_sum.price_with_tax, aggregation_orders_parent.price_with_tax) AS price_with_tax,
+    IFNULL(aggregation_orders_child_sum.discount, aggregation_orders_parent.discount) AS discount,
+    IFNULL(aggregation_orders_child_sum.discount_without_tax, aggregation_orders_parent.discount_without_tax) AS discount_without_tax,
+    IFNULL(aggregation_orders_child_sum.tax_price, aggregation_orders_parent.tax_price) AS tax_price,
+    IFNULL(aggregation_orders_child_sum.ordered_total_shipping_price_with_tax, aggregation_orders_parent.ordered_total_shipping_price_with_tax) AS ordered_total_shipping_price_with_tax,
+    IFNULL(aggregation_orders_child_sum.shipping_tax_price, aggregation_orders_parent.shipping_tax_price) AS shipping_tax_price,
+    IFNULL(aggregation_orders_child_sum.total_product_only_price_without_tax, aggregation_orders_parent.total_product_only_price_without_tax) AS total_product_only_price_without_tax,
+    IFNULL(aggregation_orders_child_sum.total_cost_without_tax, aggregation_orders_parent.total_cost_without_tax) AS total_cost_without_tax,
+    IFNULL(aggregation_orders_child_sum.gross_margin, aggregation_orders_parent.gross_margin) AS gross_margin,
+  FROM
+    aggregation_orders_parent
+  LEFT JOIN
+    aggregation_orders_child_sum
+  ON
+    aggregation_orders_parent.order_id = aggregation_orders_child_sum.order_id )
+  -- メインのMERGE文
+  # 最終情報に対してマーケのdiscountかどうかの情報を付与
+SELECT
+  order_id,
+  financial_status,
+  processed_at,
+  registered_month,
+  is_repeated,
+  order_line_id,
+  customer_id,
+  product_id,
+  product_variant_id,
+  product_title,
+  product_variant_title,
+  collection_tag,
+  sku,
+  handle,
+  product_type,
+  vendor,
+  deadline,
+  middle_category,
+  is_stock,
+  is_ordering,
+  is_direct_delivery,
+  is_strategy_product,
+  is_strategy_vendor,
+  delivery_type,
+  is_pantry,
+  is_pantry_child,
+  purchasing_manager,
+  gift_card,
+  discount_code,
+  tax_rate,
+  shipping_tax_rate,
+  isB2B,
+  grams,
+  quantity,
+  total_price_with_tax,
+  price_with_tax,
+  discount,
+  discount_without_tax,
+  tax_price,
+  ordered_total_shipping_price_with_tax,
+  shipping_tax_price,
+  total_product_only_price_without_tax,
+  total_cost_without_tax,
+  gross_margin,
+  EXISTS(
+  SELECT
+    1
+  FROM
+    master_discount_coupon
+  WHERE
+    master_discount_coupon.discount_code = aggregation_orders_merged.discount_code
+    AND master_discount_coupon.category = "マーケ" ) AS is_marketing_discount,
+  DATETIME(processed_at,'Asia/Tokyo') AS processed_datetime
+FROM
+  aggregation_orders_merged
+  ${
+      when(
+          incremental(),
+          `WHERE processed_at > (SELECT MAX(processed_at) FROM ${self()})`,
+          `WHERE TRUE`
+      )
+  }
